@@ -1,0 +1,6 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+capture_test.jpg
+request_logs/
