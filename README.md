@@ -34,7 +34,7 @@ Edit `.env` with your `OPENAI_API_KEY`, a private `BRIDGE_TOKEN`, and the correc
 ## Test The Capture Card
 
 ```bash
-python watch_presentation_bridge.py capture-test --device-index 0 --output capture_test.jpg
+python watch_presentation_bridge.py capture-test --device-index 2 --output capture_test.jpg
 ```
 
 If the saved image is not the capture-card feed, retry with `--device-index 1`, `2`, etc. On macOS, Python or Terminal may need Camera permission for OpenCV to read the capture card. On Windows, the default `CAPTURE_BACKEND=auto` uses DirectShow because that most closely matches OBS's Video Capture Device path; switch to `CAPTURE_BACKEND=msmf` if a device behaves better through Media Foundation.

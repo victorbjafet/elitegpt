@@ -4,3 +4,7 @@ __pycache__/
 *.pyc
 capture_test.jpg
 request_logs/
+tools/
+terminal1.ps1
+terminal2.ps1
+run.md
