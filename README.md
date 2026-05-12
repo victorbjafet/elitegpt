@@ -142,21 +142,133 @@ Each request folder contains:
 - `request.json`, `signal.json`, `result.json`: structured request/response metadata.
 - `error.txt` and `traceback.txt` if the request fails after the folder is created.
 
+## Cloudflare Tunnel
+
+Cloudflare Tunnel is the recommended off-LAN path. It gives the Watch Shortcut a public HTTPS URL that routes back to this laptop over an outbound `cloudflared` connection. You do not need router port forwarding or a public IP.
+
+Use a Quick Tunnel first, then move to a named tunnel when you want a stable URL.
+
+### Option A: Quick Tunnel
+
+Quick Tunnels are temporary and generate a random `trycloudflare.com` URL. They are perfect for first testing.
+
+Install `cloudflared` on macOS:
+
+```bash
+brew install cloudflared
+```
+
+On Windows, install `cloudflared` from Cloudflare's downloads page, then run the commands below in PowerShell or Command Prompt.
+
+Start the bridge in one terminal:
+
+```bash
+source .venv/bin/activate
+python watch_presentation_bridge.py serve
+```
+
+Start Cloudflare in a second terminal:
+
+```bash
+cloudflared tunnel --url http://127.0.0.1:8787
+```
+
+Copy the generated URL. It will look like:
+
+```text
+https://example-random-name.trycloudflare.com
+```
+
+Your Watch trigger URL is:
+
+```text
+https://example-random-name.trycloudflare.com/watch/trigger
+```
+
+Test it from any browser or terminal:
+
+```bash
+curl -H "Authorization: Bearer YOUR_BRIDGE_TOKEN" \
+  "https://example-random-name.trycloudflare.com/health"
+```
+
+### Option B: Named Tunnel
+
+Use this when you want a stable URL such as:
+
+```text
+https://presentation.yourdomain.com/watch/trigger
+```
+
+Requirements:
+
+- A Cloudflare account.
+- A domain added to Cloudflare.
+- `cloudflared` installed on the laptop that runs this bridge.
+
+Dashboard setup:
+
+1. Open the Cloudflare dashboard.
+2. Go to `Zero Trust` or `Networking` > `Tunnels`.
+3. Select `Create Tunnel`.
+4. Name it, for example `presentation-bridge`.
+5. Choose your operating system and copy Cloudflare's install/run command.
+6. Run that command on this laptop.
+7. Wait until the tunnel shows `Healthy`.
+8. Add a published application route.
+9. Public hostname: `presentation.yourdomain.com`.
+10. Service URL: `http://localhost:8787`.
+11. Save the route.
+
+Then your Watch trigger URL is:
+
+```text
+https://presentation.yourdomain.com/watch/trigger
+```
+
+Keep the Python bridge running whenever you want the Watch shortcut to work:
+
+```bash
+python watch_presentation_bridge.py serve
+```
+
+If you installed `cloudflared` as a service, the tunnel can run in the background. If you are using a Quick Tunnel, keep the `cloudflared tunnel --url ...` terminal open.
+
 ## Apple Watch Shortcut Flow
 
-On your iPhone/Watch Shortcuts app:
+Create this on the iPhone paired with your Apple Watch:
 
-1. Add "Get Contents of URL".
-2. URL:
-   `http://YOUR_MAC_LAN_IP:8787/watch/trigger?token=YOUR_BRIDGE_TOKEN`
-3. Method: `GET`.
-4. Add "Show Result" using the contents returned by the URL.
+1. Open `Shortcuts`.
+2. Tap `+`.
+3. Name it `Presentation Assist`.
+4. Add action: `URL`.
+5. Set the URL to your Cloudflare trigger URL:
+
+   ```text
+   https://YOUR-CLOUDFLARE-HOSTNAME/watch/trigger
+   ```
+
+6. Add action: `Get Contents of URL`.
+7. Open `Show More`.
+8. Set method to `GET`.
+9. Add header:
+
+   ```text
+   Authorization: Bearer YOUR_BRIDGE_TOKEN
+   ```
+
+10. Add action: `Show Result`.
+11. Use the output from `Get Contents of URL`.
+12. Open the shortcut details and turn on `Show on Apple Watch`.
+13. On Apple Watch, open the `Shortcuts` app and run `Presentation Assist`.
 
 You can override the prompt from the URL:
 
 ```text
-http://YOUR_MAC_LAN_IP:8787/watch/trigger?token=YOUR_BRIDGE_TOKEN&prompt=Summarize%20the%20slide%20in%202%20bullets
+https://YOUR-CLOUDFLARE-HOSTNAME/watch/trigger?prompt=Summarize%20the%20slide%20in%202%20bullets
 ```
+
+Keep using the `Authorization` header even when you add query parameters.
 
 For a native app or richer Shortcut, POST JSON to `/watch/signal`:
 
@@ -168,30 +280,6 @@ For a native app or richer Shortcut, POST JSON to `/watch/signal`:
 ```
 
 Send the token as either `Authorization: Bearer YOUR_BRIDGE_TOKEN`, `X-Bridge-Token: YOUR_BRIDGE_TOKEN`, or the `token` query parameter.
-
-## Off-LAN Watch Flow Options
-
-The cleanest off-LAN setup is still a Watch Shortcut calling one HTTPS URL and showing the returned text. Apple documents that Apple Watch can run enabled shortcuts, and Shortcuts can make API requests with "Get Contents of URL". So the best move is usually to keep this Python service exactly as-is, then expose it through a tunnel:
-
-```bash
-python watch_presentation_bridge.py serve
-cloudflared tunnel --url http://localhost:8787
-```
-
-Then point the Watch Shortcut at:
-
-```text
-https://YOUR-TUNNEL.trycloudflare.com/watch/trigger?token=YOUR_BRIDGE_TOKEN
-```
-
-Good options:
-
-- Cloudflare Tunnel: best default if you want a stable public hostname later. It creates outbound-only encrypted connections, so you do not need port forwarding or a public IP.
-- ngrok: fastest temporary demo path. `ngrok http 8787` gives you a public HTTPS URL routed back to this laptop.
-- Tailscale Funnel: good if you already use Tailscale. It exposes a local service to the broader internet, but has port/platform constraints and is beta.
-- Discord relay: possible, but clunkier. The Watch Shortcut can post to a Discord incoming webhook, and a laptop bot can listen through Discord Gateway WebSockets and reply in a channel. That avoids exposing this laptop directly, but viewing the result on Apple Watch depends on Discord notifications or a third-party Watch Discord app, and a bot may need Discord's Message Content intent.
-
-Recommendation: use Cloudflare Tunnel or ngrok for the first real test. Use Discord only if you specifically want the response to live in a Discord channel/history.
 
 ## Endpoints
 
