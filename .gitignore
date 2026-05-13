@@ -3,9 +3,12 @@
 __pycache__/
 *.pyc
 capture_test.jpg
+capture_test_cropped.jpg
 request_logs/
 tools/
 terminal1.ps1
 terminal2.ps1
+terminal1_mac.sh
+terminal2_mac.sh
 run.md
 .DS_Store

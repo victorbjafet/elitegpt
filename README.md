@@ -29,15 +29,23 @@ python -m pip install -r requirements.txt
 copy .env.example .env
 ```
 
-Edit `.env` with your `OPENAI_API_KEY`, a private `BRIDGE_TOKEN`, and the correct `CAPTURE_DEVICE_INDEX`.
+Edit `.env` with your `OPENAI_API_KEY`, a private `BRIDGE_TOKEN`, and the correct capture device settings. On macOS, prefer `CAPTURE_DEVICE_NAMES=USB3 Video,USB2 Video`; `CAPTURE_DEVICE_INDEX` is only the fallback.
 
 ## Test The Capture Card
 
 ```bash
-python watch_presentation_bridge.py capture-test --device-index 2 --output capture_test.jpg
+python watch_presentation_bridge.py capture-test --output capture_test.jpg
 ```
 
-If the saved image is not the capture-card feed, retry with `--device-index 1`, `2`, etc. On macOS, Python or Terminal may need Camera permission for OpenCV to read the capture card. On Windows, the default `CAPTURE_BACKEND=auto` uses DirectShow because that most closely matches OBS's Video Capture Device path; switch to `CAPTURE_BACKEND=msmf` if a device behaves better through Media Foundation.
+This writes the raw capture-card frame to `capture_test.jpg`. It also reads the crop/resize settings from `.env` and writes the post-crop image to `capture_test_cropped.jpg`, which matches the image that would be sent to OpenAI.
+
+If the saved image is not the capture-card feed, check `CAPTURE_DEVICE_NAMES` first. On macOS, the bridge looks for those AVFoundation names before using `CAPTURE_DEVICE_INDEX`, so `USB3 Video` and `USB2 Video` can swap indexes without breaking the script. You can still force an index with `--device-index 1`, `2`, etc. On macOS, Python or Terminal may need Camera permission for OpenCV to read the capture card. On Windows, the default `CAPTURE_BACKEND=auto` uses DirectShow because that most closely matches OBS's Video Capture Device path; switch to `CAPTURE_BACKEND=msmf` if a device behaves better through Media Foundation.
+
+To inspect the current macOS camera list and selected index without opening the capture card:
+
+```bash
+curl -H "Authorization: Bearer YOUR_BRIDGE_TOKEN" http://127.0.0.1:8787/capture/devices
+```
 
 ## Run
 
@@ -53,6 +61,8 @@ The bridge keeps the capture-card input active between requests, like an OBS sou
 
 That reset mirrors the OBS workflow: release the active device handle, pause briefly, reopen it with the configured backend, reapply width/height/FPS/format settings, warm up the input, and recapture once before sending the image to OpenAI. This is stronger than simply opening a new one-off capture because it actually tears down the held video input.
 
+On macOS, unplug/replug can leave the old AVFoundation/OpenCV handle open but not delivering frames. If a read times out, the bridge now fully releases the handle, re-resolves `CAPTURE_DEVICE_NAMES`, retries several times, and finally tries a one-shot fresh Python subprocess capture. That fallback mimics restarting just the capture stack while keeping the web server alive.
+
 Default settings:
 
 ```env
@@ -63,6 +73,10 @@ CAPTURE_FPS=0
 CAPTURE_FOURCC=
 CAPTURE_BUFFER_SIZE=1
 CAPTURE_STRICT_MODE=false
+CAPTURE_READ_RETRIES=3
+CAPTURE_READ_RETRY_PAUSE_SECONDS=1.5
+CAPTURE_SUBPROCESS_FALLBACK_ENABLED=true
+CAPTURE_SUBPROCESS_TIMEOUT_SECONDS=30
 CAPTURE_STALE_WATCHDOG_ENABLED=true
 STALE_FRAME_SECONDS=20
 STALE_FRAME_DIFF_THRESHOLD=2.0
@@ -83,6 +97,7 @@ curl -X POST "http://localhost:8787/capture/reactivate?token=YOUR_BRIDGE_TOKEN"
 `CAPTURE_WIDTH`, `CAPTURE_HEIGHT`, `CAPTURE_FPS`, and `CAPTURE_FOURCC` are the requested capture-card mode. This is the closest OpenCV equivalent to setting the resolution/FPS/video format in OBS's Video Capture Device properties. The bridge applies these settings when it activates or reactivates the device.
 
 ```env
+CAPTURE_DEVICE_NAMES=USB3 Video,USB2 Video
 CAPTURE_WIDTH=1920
 CAPTURE_HEIGHT=1080
 CAPTURE_FPS=60
@@ -90,6 +105,8 @@ CAPTURE_FOURCC=MJPG
 ```
 
 Some capture cards ignore unsupported modes and fall back silently. The response metadata and `capture_metadata.json` include both `requested_mode` and the actual device properties. Set `CAPTURE_STRICT_MODE=true` if you want the request to fail when the device does not accept the requested width/height.
+
+The bridge also checks the actual frame dimensions returned by OpenCV. This matters because some backends report the requested mode through device properties even when the delivered frame is smaller.
 
 ## Post-Capture Crop And Upload Size
 
@@ -122,6 +139,12 @@ JPEG_QUALITY=92
 ```
 
 If only one output side is set, the other side is calculated to preserve aspect ratio. If both are set, the image is resized to that exact size.
+
+## OpenAI Session Memory
+
+The bridge chains OpenAI Responses API calls with `previous_response_id`, so each non-dry-run request continues the same model conversation while the Python process is running. The session starts on the first OpenAI request and resets only when the bridge process restarts.
+
+Each result and request log includes `openai_session` metadata with the response id used for chaining. Because chained context is included in later calls, longer sessions can cost more tokens over time.
 
 ## Debug Request Logs
 
@@ -167,10 +190,22 @@ source .venv/bin/activate
 python watch_presentation_bridge.py serve
 ```
 
+On this Mac, you can use:
+
+```bash
+./terminal1_mac.sh
+```
+
 Start Cloudflare in a second terminal:
 
 ```bash
 cloudflared tunnel --url http://127.0.0.1:8787
+```
+
+For the named tunnel used by the local helper scripts, store the token in `.env` as `CLOUDFLARED_TUNNEL_TOKEN`, then run:
+
+```bash
+./terminal2_mac.sh
 ```
 
 Copy the generated URL. It will look like:
@@ -287,7 +322,8 @@ Send the token as either `Authorization: Bearer YOUR_BRIDGE_TOKEN`, `X-Bridge-To
 - `GET /watch/trigger`: capture and return plain text, best for a simple Watch Shortcut.
 - `POST /watch/signal`: capture and return JSON with text, latency, and callback status.
 - `GET /watch/last`: return the most recent JSON result.
-- `POST /capture/reactivate`: manually release/reopen the capture-card input.
+- `GET /capture/devices`: list name-resolved capture devices and the selected index.
+- `POST /capture/reactivate`: manually release/reopen the capture-card input, re-resolving `CAPTURE_DEVICE_NAMES`.
 
 ## Notes
 

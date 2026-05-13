@@ -16,6 +16,10 @@ import json
 import logging
 import os
 import platform
+import subprocess
+import sys
+import tempfile
+import threading
 import time
 import traceback
 import uuid
@@ -90,6 +94,7 @@ class Settings:
     image_detail: str = os.getenv("IMAGE_DETAIL", "auto")
     max_output_tokens: int = _env_int("MAX_OUTPUT_TOKENS", 700)
     capture_device_index: int = _env_int("CAPTURE_DEVICE_INDEX", 0)
+    capture_device_names: str = os.getenv("CAPTURE_DEVICE_NAMES", "")
     capture_backend: str = os.getenv("CAPTURE_BACKEND", "auto")
     capture_width: int = _env_int("CAPTURE_WIDTH", 1920)
     capture_height: int = _env_int("CAPTURE_HEIGHT", 1080)
@@ -100,6 +105,19 @@ class Settings:
     capture_mode_tolerance_pixels: int = _env_int("CAPTURE_MODE_TOLERANCE_PIXELS", 8)
     capture_warmup_frames: int = _env_int("CAPTURE_WARMUP_FRAMES", 4)
     capture_timeout_seconds: float = _env_float("CAPTURE_TIMEOUT_SECONDS", 4.0)
+    capture_read_retries: int = _env_int("CAPTURE_READ_RETRIES", 3)
+    capture_read_retry_pause_seconds: float = _env_float(
+        "CAPTURE_READ_RETRY_PAUSE_SECONDS",
+        1.5,
+    )
+    capture_subprocess_fallback_enabled: bool = _env_bool(
+        "CAPTURE_SUBPROCESS_FALLBACK_ENABLED",
+        True,
+    )
+    capture_subprocess_timeout_seconds: float = _env_float(
+        "CAPTURE_SUBPROCESS_TIMEOUT_SECONDS",
+        30.0,
+    )
     capture_stale_watchdog_enabled: bool = _env_bool(
         "CAPTURE_STALE_WATCHDOG_ENABLED",
         True,
@@ -141,6 +159,26 @@ class RequestLog:
     path: Path
 
 
+@dataclass(frozen=True)
+class CaptureDeviceSelection:
+    index: int
+    metadata: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class OpenAIResult:
+    text: str
+    response_id: str | None
+    previous_response_id: str | None
+    turn_count: int
+
+
+@dataclass
+class OpenAISessionState:
+    previous_response_id: str | None = None
+    turn_count: int = 0
+
+
 @dataclass
 class CaptureWatchdogState:
     device_index: int | None = None
@@ -175,12 +213,15 @@ class BridgeResult(BaseModel):
     model: str
     captured_at: str
     latency_ms: int
+    openai_session: dict[str, Any] | None = None
     capture: dict[str, Any] | None = None
     callback: dict[str, Any] | None = None
 
 
 capture_lock = asyncio.Lock()
 capture_watchdog_state = CaptureWatchdogState()
+openai_session_lock = threading.Lock()
+openai_session_state = OpenAISessionState()
 last_result: BridgeResult | None = None
 capture_manager: Any | None = None
 
@@ -252,6 +293,84 @@ def resolve_capture_backend(cv2: Any) -> tuple[int, str]:
     return getattr(cv2, constant_name), requested
 
 
+def normalize_device_name(name: str) -> str:
+    return " ".join(name.casefold().strip().split())
+
+
+def capture_device_name_preferences() -> list[str]:
+    raw = settings.capture_device_names.strip()
+    if not raw:
+        return []
+
+    for separator in (";", "|"):
+        raw = raw.replace(separator, ",")
+    return [name.strip() for name in raw.split(",") if name.strip()]
+
+
+def enumerate_macos_video_devices() -> list[dict[str, Any]]:
+    if platform.system() != "Darwin":
+        return []
+
+    try:
+        import AVFoundation
+    except ImportError:
+        logger.warning(
+            "CAPTURE_DEVICE_NAMES is configured, but pyobjc-framework-AVFoundation "
+            "is not installed; falling back to CAPTURE_DEVICE_INDEX."
+        )
+        return []
+
+    devices = AVFoundation.AVCaptureDevice.devicesWithMediaType_(
+        AVFoundation.AVMediaTypeVideo,
+    )
+    return [
+        {
+            "index": index,
+            "name": str(device.localizedName()),
+            "unique_id": str(device.uniqueID()),
+            "source": "avfoundation",
+        }
+        for index, device in enumerate(devices)
+    ]
+
+
+def enumerate_named_capture_devices() -> list[dict[str, Any]]:
+    if platform.system() == "Darwin":
+        return enumerate_macos_video_devices()
+
+    logger.warning(
+        "CAPTURE_DEVICE_NAMES is only implemented for macOS right now; "
+        "falling back to CAPTURE_DEVICE_INDEX on %s.",
+        platform.system(),
+    )
+    return []
+
+
+def choose_capture_device_by_name(
+    preferences: list[str],
+    devices: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if not preferences or not devices:
+        return None
+
+    normalized_devices = [
+        (device, normalize_device_name(str(device.get("name", ""))))
+        for device in devices
+    ]
+
+    for preferred in preferences:
+        preferred_normalized = normalize_device_name(preferred)
+        for device, device_name in normalized_devices:
+            if device_name == preferred_normalized:
+                return device
+
+        for device, device_name in normalized_devices:
+            if preferred_normalized in device_name:
+                return device
+
+    return None
+
+
 class CaptureDeviceManager:
     """OBS-like lifecycle for a capture-card input.
 
@@ -266,6 +385,59 @@ class CaptureDeviceManager:
         self.device_index: int | None = None
         self.backend_name = ""
         self.opened_at: float | None = None
+        self.device_selection: dict[str, Any] | None = None
+
+    def resolve_device(self, requested_index: int | None = None) -> CaptureDeviceSelection:
+        if requested_index is not None:
+            return CaptureDeviceSelection(
+                index=requested_index,
+                metadata={
+                    "source": "request_index",
+                    "index": requested_index,
+                    "configured_names": capture_device_name_preferences(),
+                },
+            )
+
+        preferences = capture_device_name_preferences()
+        if preferences:
+            devices = enumerate_named_capture_devices()
+            selected = choose_capture_device_by_name(preferences, devices)
+            if selected is not None:
+                return CaptureDeviceSelection(
+                    index=int(selected["index"]),
+                    metadata={
+                        "source": selected.get("source", "device_name"),
+                        "index": int(selected["index"]),
+                        "name": selected.get("name"),
+                        "unique_id": selected.get("unique_id"),
+                        "configured_names": preferences,
+                        "available_devices": [
+                            {
+                                "index": device.get("index"),
+                                "name": device.get("name"),
+                                "unique_id": device.get("unique_id"),
+                            }
+                            for device in devices
+                        ],
+                    },
+                )
+
+            logger.warning(
+                "No capture device matched CAPTURE_DEVICE_NAMES=%s. Available devices: %s. "
+                "Falling back to CAPTURE_DEVICE_INDEX=%s.",
+                preferences,
+                [device.get("name") for device in devices],
+                settings.capture_device_index,
+            )
+
+        return CaptureDeviceSelection(
+            index=settings.capture_device_index,
+            metadata={
+                "source": "fallback_index",
+                "index": settings.capture_device_index,
+                "configured_names": preferences,
+            },
+        )
 
     def is_active_for(self, index: int) -> bool:
         return (
@@ -309,6 +481,7 @@ class CaptureDeviceManager:
         self.device_index = index
         self.backend_name = backend_name
         self.opened_at = time.monotonic()
+        self.device_selection = None
         try:
             self.configure_active_device()
             self.warm_up()
@@ -341,6 +514,7 @@ class CaptureDeviceManager:
         self.device_index = None
         self.backend_name = ""
         self.opened_at = None
+        self.device_selection = None
 
         return {
             "ok": True,
@@ -349,19 +523,41 @@ class CaptureDeviceManager:
             "backend": previous_backend or None,
         }
 
-    def reactivate(self, index: int) -> dict[str, Any]:
+    def reactivate(
+        self,
+        requested_index: int | None = None,
+        *,
+        force_index: int | None = None,
+    ) -> dict[str, Any]:
         started = time.monotonic()
         attempts = max(1, settings.video_reactivation_attempts)
         pause = max(0.0, settings.video_reactivation_pause_seconds)
         last_error = ""
         deactivation = self.deactivate()
+        last_selection: CaptureDeviceSelection | None = None
 
         for attempt in range(1, attempts + 1):
+            selection = (
+                CaptureDeviceSelection(
+                    index=force_index,
+                    metadata={
+                        "source": "forced_reactivation_index",
+                        "index": force_index,
+                        "configured_names": capture_device_name_preferences(),
+                    },
+                )
+                if force_index is not None
+                else self.resolve_device(requested_index)
+            )
+            last_selection = selection
+            index = selection.index
+
             logger.warning(
-                "Reactivating capture device index %s, attempt %s/%s",
+                "Reactivating capture device index %s, attempt %s/%s, selection=%s",
                 index,
                 attempt,
                 attempts,
+                selection.metadata,
             )
             if pause:
                 time.sleep(pause)
@@ -380,15 +576,17 @@ class CaptureDeviceManager:
                 "attempts": attempt,
                 "elapsed_ms": round((time.monotonic() - started) * 1000),
                 "deactivation": deactivation,
+                "device_selection": selection.metadata,
                 "activation": activation,
             }
 
         return {
             "ok": False,
-            "device_index": index,
+            "device_index": last_selection.index if last_selection else requested_index,
             "attempts": attempts,
             "elapsed_ms": round((time.monotonic() - started) * 1000),
             "deactivation": deactivation,
+            "device_selection": last_selection.metadata if last_selection else None,
             "error": last_error or "Video input reactivation failed",
         }
 
@@ -474,29 +672,96 @@ class CaptureDeviceManager:
             "fourcc": self.actual_fourcc(),
         }
 
-    def read_frame(self, index: int) -> tuple[Any, dict[str, Any]]:
+    def read_frame(self, selection: CaptureDeviceSelection) -> tuple[Any, dict[str, Any]]:
+        requested_index = (
+            selection.index
+            if selection.metadata.get("source") == "request_index"
+            else None
+        )
+        index = selection.index
         activation = self.activate(index)
+        read_attempts: list[dict[str, Any]] = [
+            {
+                "kind": "initial",
+                "device_index": index,
+                "selection": selection.metadata,
+            }
+        ]
+
         frame = self._read_frame_from_active()
-
         read_failure_reactivation = None
-        if frame is None:
-            read_failure_reactivation = self.reactivate(index)
-            if read_failure_reactivation.get("ok"):
-                frame = self._read_frame_from_active()
+        retry_count = max(0, settings.capture_read_retries)
+        retry_pause = max(0.0, settings.capture_read_retry_pause_seconds)
+
+        for retry_number in range(1, retry_count + 1):
+            if frame is not None:
+                break
+
+            logger.warning(
+                "Timed out reading from capture device index %s; retrying %s/%s "
+                "after full reactivation.",
+                index,
+                retry_number,
+                retry_count,
+            )
+            if retry_pause:
+                time.sleep(retry_pause)
+
+            read_failure_reactivation = self.reactivate(requested_index)
+            read_attempts.append(
+                {
+                    "kind": "reactivation_retry",
+                    "retry_number": retry_number,
+                    "result": read_failure_reactivation,
+                }
+            )
+            if not read_failure_reactivation.get("ok"):
+                continue
+
+            reactivated_index = read_failure_reactivation.get("device_index")
+            if isinstance(reactivated_index, int):
+                index = reactivated_index
+                selection = CaptureDeviceSelection(
+                    index=index,
+                    metadata=read_failure_reactivation.get("device_selection") or selection.metadata,
+                )
+            frame = self._read_frame_from_active()
 
         if frame is None:
+            self.deactivate()
             raise RuntimeError(f"Timed out waiting for a frame from device index {index}")
 
         height, width = frame.shape[:2]
+        self.validate_frame_shape(width, height)
         metadata = {
             "device_index": index,
             "backend": self.backend_name,
             "activation": activation,
             "read_failure_reactivation": read_failure_reactivation,
+            "read_attempts": read_attempts,
+            "selection": selection.metadata,
             "requested_mode": self.requested_properties(),
             "raw_frame": {"width": width, "height": height},
         }
         return frame, metadata
+
+    def validate_frame_shape(self, width: int, height: int) -> None:
+        tolerance = max(0, settings.capture_mode_tolerance_pixels)
+        width_delta = abs(width - settings.capture_width)
+        height_delta = abs(height - settings.capture_height)
+
+        if width_delta <= tolerance and height_delta <= tolerance:
+            return
+
+        message = (
+            "Capture device produced a different frame size than requested: "
+            f"requested={settings.capture_width}x{settings.capture_height}, "
+            f"actual={width}x{height}. The device/backend may have rejected "
+            "the requested mode."
+        )
+        if settings.capture_strict_mode:
+            raise RuntimeError(message)
+        logger.warning(message)
 
     def _read_frame_from_active(self) -> Any | None:
         if self.cap is None:
@@ -600,8 +865,8 @@ def evaluate_frame_staleness(cv2: Any, frame: Any, index: int) -> dict[str, Any]
 
 
 def deactivate_and_reactivate_video_input(device_index: int | None = None) -> dict[str, Any]:
-    index = settings.capture_device_index if device_index is None else device_index
-    return get_capture_manager().reactivate(index)
+    manager = get_capture_manager()
+    return manager.reactivate(device_index)
 
 
 def apply_image_crop_and_resize(cv2: Any, frame: Any) -> tuple[Any, dict[str, Any]]:
@@ -700,18 +965,115 @@ def encode_jpeg(cv2: Any, frame: Any, quality: int) -> bytes:
     return encoded.tobytes()
 
 
+def capture_subprocess_worker_enabled() -> bool:
+    return os.getenv("WATCH_BRIDGE_CAPTURE_WORKER") != "1"
+
+
+def capture_jpeg_frame_result_subprocess(
+    device_index: int | None,
+    original_error: Exception,
+) -> CaptureResult:
+    if (
+        not settings.capture_subprocess_fallback_enabled
+        or not capture_subprocess_worker_enabled()
+    ):
+        raise original_error
+
+    started = time.monotonic()
+    logger.warning(
+        "In-process capture failed; trying fresh subprocess capture: %s",
+        original_error,
+    )
+
+    with tempfile.TemporaryDirectory(prefix="watch_bridge_capture_") as tmpdir:
+        output_dir = Path(tmpdir)
+        command = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "capture-worker",
+            "--output-dir",
+            str(output_dir),
+        ]
+        if device_index is not None:
+            command.extend(["--device-index", str(device_index)])
+
+        env = os.environ.copy()
+        env["WATCH_BRIDGE_CAPTURE_WORKER"] = "1"
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=str(Path(__file__).resolve().parent),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=settings.capture_subprocess_timeout_seconds,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                "In-process capture failed, and subprocess capture timed out. "
+                f"Original error: {original_error}."
+            ) from exc
+
+        if completed.returncode != 0:
+            raise RuntimeError(
+                "In-process capture failed, and subprocess capture also failed. "
+                f"Original error: {original_error}. "
+                f"Subprocess return code: {completed.returncode}. "
+                f"Subprocess stderr: {completed.stderr[-4000:]}"
+            ) from original_error
+
+        raw_jpeg_bytes = (output_dir / "raw_capture.jpg").read_bytes()
+        jpeg_bytes = (output_dir / "sent_to_openai.jpg").read_bytes()
+        metadata = json.loads((output_dir / "capture_metadata.json").read_text(encoding="utf-8"))
+        metadata["subprocess_fallback"] = {
+            "used": True,
+            "elapsed_ms": round((time.monotonic() - started) * 1000),
+            "original_error": str(original_error),
+            "stdout_tail": completed.stdout[-2000:],
+            "stderr_tail": completed.stderr[-2000:],
+        }
+        return CaptureResult(
+            jpeg_bytes=jpeg_bytes,
+            raw_jpeg_bytes=raw_jpeg_bytes,
+            metadata=metadata,
+        )
+
+
 def capture_jpeg_frame_result(device_index: int | None = None) -> CaptureResult:
-    index = settings.capture_device_index if device_index is None else device_index
     manager = get_capture_manager()
+    selection = manager.resolve_device(device_index)
+    index = selection.index
+    manager.device_selection = selection.metadata
     cv2 = manager.cv2
-    frame, read_metadata = manager.read_frame(index)
+    try:
+        frame, read_metadata = manager.read_frame(selection)
+    except Exception as exc:
+        manager.deactivate()
+        return capture_jpeg_frame_result_subprocess(device_index, exc)
+
+    index = int(read_metadata["device_index"])
+    selection = CaptureDeviceSelection(
+        index=index,
+        metadata=read_metadata.get("selection") or selection.metadata,
+    )
     stale_watchdog = evaluate_frame_staleness(cv2, frame, index)
 
     if stale_watchdog.get("reactivation_needed"):
-        reset_result = manager.reactivate(index)
+        reset_result = manager.reactivate(device_index)
         stale_watchdog["reactivation"] = reset_result
         if reset_result.get("ok"):
-            frame, read_metadata = manager.read_frame(index)
+            reactivated_index = reset_result.get("device_index")
+            reactivated_selection = CaptureDeviceSelection(
+                index=int(reactivated_index),
+                metadata=reset_result.get("device_selection") or selection.metadata,
+            )
+            frame, read_metadata = manager.read_frame(reactivated_selection)
+            index = int(read_metadata["device_index"])
+            selection = CaptureDeviceSelection(
+                index=index,
+                metadata=read_metadata.get("selection") or reactivated_selection.metadata,
+            )
             reset_watchdog_signature(cv2, frame, index)
             stale_watchdog["recaptured_after_reactivation"] = True
     else:
@@ -723,6 +1085,7 @@ def capture_jpeg_frame_result(device_index: int | None = None) -> CaptureResult:
     jpeg_bytes = encode_jpeg(cv2, processed_frame, jpeg_quality)
     metadata = {
         "device_index": index,
+        "device_selection": selection.metadata,
         "device": read_metadata,
         "image": image_metadata,
         "jpeg_quality": jpeg_quality,
@@ -832,29 +1195,7 @@ def save_error_artifacts(
     write_text(request_log.path / "traceback.txt", traceback.format_exc())
 
 
-def ask_openai(prompt: str, image_data_url: str) -> str:
-    if not settings.openai_api_key:
-        raise RuntimeError("OPENAI_API_KEY is not set")
-
-    client = OpenAI(api_key=settings.openai_api_key)
-    response = client.responses.create(
-        model=settings.openai_model,
-        max_output_tokens=settings.max_output_tokens,
-        input=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": prompt},
-                    {
-                        "type": "input_image",
-                        "image_url": image_data_url,
-                        "detail": settings.image_detail,
-                    },
-                ],
-            }
-        ],
-    )
-
+def extract_response_text(response: Any) -> str:
     text = getattr(response, "output_text", None)
     if text:
         return text.strip()
@@ -867,6 +1208,74 @@ def ask_openai(prompt: str, image_data_url: str) -> str:
             if value:
                 chunks.append(value)
     return "\n".join(chunks).strip()
+
+
+def ask_openai(prompt: str, image_data_url: str) -> OpenAIResult:
+    if not settings.openai_api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set")
+
+    client = OpenAI(api_key=settings.openai_api_key)
+
+    with openai_session_lock:
+        previous_response_id = openai_session_state.previous_response_id
+        request: dict[str, Any] = {
+            "model": settings.openai_model,
+            "max_output_tokens": settings.max_output_tokens,
+            "store": True,
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": prompt},
+                        {
+                            "type": "input_image",
+                            "image_url": image_data_url,
+                            "detail": settings.image_detail,
+                        },
+                    ],
+                }
+            ],
+        }
+
+        if previous_response_id:
+            request["previous_response_id"] = previous_response_id
+
+        response = client.responses.create(**request)
+        response_id = getattr(response, "id", None)
+        if response_id:
+            openai_session_state.previous_response_id = response_id
+            openai_session_state.turn_count += 1
+        turn_count = openai_session_state.turn_count
+
+    return OpenAIResult(
+        text=extract_response_text(response),
+        response_id=response_id,
+        previous_response_id=previous_response_id,
+        turn_count=turn_count,
+    )
+
+
+def openai_session_metadata(result: OpenAIResult | None) -> dict[str, Any]:
+    return {
+        "enabled": True,
+        "turn_count": result.turn_count if result else openai_session_state.turn_count,
+        "previous_response_id_used": result.previous_response_id if result else None,
+        "response_id": result.response_id if result else None,
+        "resets_when": "python_process_restarts",
+    }
+
+
+def dry_run_openai_session_metadata() -> dict[str, Any]:
+    with openai_session_lock:
+        turn_count = openai_session_state.turn_count
+    return {
+        "enabled": True,
+        "turn_count": turn_count,
+        "previous_response_id_used": None,
+        "response_id": None,
+        "resets_when": "python_process_restarts",
+        "dry_run": True,
+    }
 
 
 async def send_callback(callback_url: str, result: BridgeResult) -> dict[str, Any]:
@@ -898,6 +1307,7 @@ async def run_bridge_flow(signal: WatchSignal) -> BridgeResult:
 
         save_capture_artifacts(request_log, capture_result)
         jpeg_bytes = capture_result.jpeg_bytes
+        session_metadata: dict[str, Any]
 
         if signal.dry_run:
             reset_note = ""
@@ -905,11 +1315,14 @@ async def run_bridge_flow(signal: WatchSignal) -> BridgeResult:
             if stale_watchdog.get("recaptured_after_reactivation"):
                 reset_note = " Reactivated video input before recapturing."
             text = f"Dry run captured {len(jpeg_bytes):,} bytes from the capture card.{reset_note}"
+            session_metadata = dry_run_openai_session_metadata()
         else:
             image_data_url = jpeg_to_data_url(jpeg_bytes)
-            text = await asyncio.to_thread(ask_openai, prompt, image_data_url)
+            openai_result = await asyncio.to_thread(ask_openai, prompt, image_data_url)
+            text = openai_result.text
             if not text:
                 text = "The model returned an empty response."
+            session_metadata = openai_session_metadata(openai_result)
 
         result = BridgeResult(
             ok=True,
@@ -917,6 +1330,7 @@ async def run_bridge_flow(signal: WatchSignal) -> BridgeResult:
             model=settings.openai_model,
             captured_at=captured_at,
             latency_ms=round((time.monotonic() - started) * 1000),
+            openai_session=session_metadata,
             capture=capture_result.metadata,
             callback=None,
         )
@@ -962,12 +1376,18 @@ async def health() -> dict[str, Any]:
         and getattr(capture_manager, "cap", None) is not None
         and bool(capture_manager.cap.isOpened())
     )
+    with openai_session_lock:
+        session_turn_count = openai_session_state.turn_count
+        session_active = openai_session_state.previous_response_id is not None
     return {
         "ok": True,
         "model": settings.openai_model,
         "capture_device_index": settings.capture_device_index,
+        "capture_device_names": capture_device_name_preferences(),
         "capture_backend": settings.capture_backend,
         "capture_active": manager_active,
+        "openai_session_active": session_active,
+        "openai_session_turn_count": session_turn_count,
         "token_required": bool(settings.bridge_token),
     }
 
@@ -1001,6 +1421,18 @@ async def watch_last(_: None = Depends(require_token)) -> BridgeResult | None:
     return last_result
 
 
+@app.get("/capture/devices")
+async def capture_devices(_: None = Depends(require_token)) -> dict[str, Any]:
+    manager = get_capture_manager()
+    selection = manager.resolve_device(None)
+    return {
+        "preferences": capture_device_name_preferences(),
+        "selected": selection.metadata,
+        "available_devices": enumerate_named_capture_devices(),
+        "fallback_index": settings.capture_device_index,
+    }
+
+
 @app.post("/capture/reactivate")
 async def capture_reactivate(
     capture_device_index: int | None = Query(default=None),
@@ -1013,10 +1445,38 @@ async def capture_reactivate(
         )
 
 
-def save_capture_test(path: Path, device_index: int | None) -> None:
-    jpeg = capture_jpeg_frame(device_index)
-    path.write_bytes(jpeg)
-    print(f"Saved capture test frame to {path}")
+def default_cropped_capture_path(path: Path) -> Path:
+    suffix = path.suffix or ".jpg"
+    return path.with_name(f"{path.stem}_cropped{suffix}")
+
+
+def save_capture_test(
+    path: Path,
+    device_index: int | None,
+    cropped_path: Path | None = None,
+) -> None:
+    capture_result = capture_jpeg_frame_result(device_index)
+    cropped_path = cropped_path or default_cropped_capture_path(path)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cropped_path.parent.mkdir(parents=True, exist_ok=True)
+
+    path.write_bytes(capture_result.raw_jpeg_bytes)
+    cropped_path.write_bytes(capture_result.jpeg_bytes)
+
+    image_metadata = capture_result.metadata.get("image", {})
+    print(f"Saved raw capture test frame to {path}")
+    print(f"Saved env-cropped capture test frame to {cropped_path}")
+    print(f"Image transform metadata: {json.dumps(image_metadata, sort_keys=True)}")
+
+
+def save_capture_worker_output(output_dir: Path, device_index: int | None) -> None:
+    os.environ["WATCH_BRIDGE_CAPTURE_WORKER"] = "1"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    capture_result = capture_jpeg_frame_result(device_index)
+    (output_dir / "raw_capture.jpg").write_bytes(capture_result.raw_jpeg_bytes)
+    (output_dir / "sent_to_openai.jpg").write_bytes(capture_result.jpeg_bytes)
+    write_json(output_dir / "capture_metadata.json", capture_result.metadata)
 
 
 def main() -> None:
@@ -1033,13 +1493,30 @@ def main() -> None:
         help="Save one capture-card frame to a JPEG file",
     )
     capture_parser.add_argument("--output", default="capture_test.jpg")
+    capture_parser.add_argument(
+        "--cropped-output",
+        default=None,
+        help="Path for the env-cropped/processed test image. Defaults to OUTPUT with _cropped before the extension.",
+    )
     capture_parser.add_argument("--device-index", type=int, default=None)
+
+    worker_parser = subparsers.add_parser(
+        "capture-worker",
+        help=argparse.SUPPRESS,
+    )
+    worker_parser.add_argument("--output-dir", required=True)
+    worker_parser.add_argument("--device-index", type=int, default=None)
 
     args = parser.parse_args()
     command = args.command or "serve"
 
     if command == "capture-test":
-        save_capture_test(Path(args.output), args.device_index)
+        cropped_output = Path(args.cropped_output) if args.cropped_output else None
+        save_capture_test(Path(args.output), args.device_index, cropped_output)
+        return
+
+    if command == "capture-worker":
+        save_capture_worker_output(Path(args.output_dir), args.device_index)
         return
 
     uvicorn.run(
